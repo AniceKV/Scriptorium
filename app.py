@@ -387,20 +387,43 @@ class GPTLanguageModel(nn.Module):
         return idx
 
 
-# ── Load model ─────────────────────────────────────────────────────────────
+import os
+import gdown
+
+MODEL_PATH = "model/bible_best.pt"
+
+
 @st.cache_resource
 def load_model():
-    ckpt = torch.load('model/bible_best.pt', map_location=device)
-    stoi = ckpt['stoi']
-    itos = ckpt['itos']
-    vocab_size = ckpt['vocab_size']
-    encode = lambda s: [stoi[c] for c in s if c in stoi]
-    decode = lambda l: ''.join([itos[i] for i in l])
-    model = GPTLanguageModel().to(device)
-    model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    model.eval()
-    return model, encode, decode
 
+    if not os.path.exists(MODEL_PATH):
+
+        os.makedirs("model", exist_ok=True)
+
+        file_id = "1wwI9Nmhgo0UE9LWQgvYUZOaAtNomZSIV"
+
+        with st.spinner("Downloading model..."):
+            gdown.download(
+                f"https://drive.google.com/uc?id={file_id}",
+                MODEL_PATH,
+                quiet=False
+            )
+
+        st.success("Model downloaded successfully!")
+
+    ckpt = torch.load(MODEL_PATH, map_location=device)
+
+    stoi = ckpt["stoi"]
+    itos = ckpt["itos"]
+
+    encode = lambda s: [stoi[c] for c in s if c in stoi]
+    decode = lambda l: "".join([itos[i] for i in l])
+
+    model = GPTLanguageModel().to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    return model, encode, decode
 
 # ── UI ─────────────────────────────────────────────────────────────────────
 
