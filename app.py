@@ -443,7 +443,7 @@ col1, col2 = st.columns(2)
 with col1:
     temperature = st.slider("Temperature", 0.5, 1.5, 0.8, 0.05)
 with col2:
-    max_tokens = st.slider("Length", 50, 200, 100, 20)
+    max_tokens = st.slider("Length", 50, 1000, 100, 20)
 
 st.markdown("<br>", unsafe_allow_html=True)
 generate_btn = st.button("✦ Speak the Word ✦")
