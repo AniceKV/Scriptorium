@@ -1,0 +1,7 @@
+# Core app dependencies
+streamlit
+gdown
+
+# Install the PyTorch build appropriate for your platform/accelerator.
+torch
+
