@@ -208,7 +208,7 @@ label[data-testid="stWidgetLabel"] p{
 
 
 # ── Hyperparameters (must match training) ──────────────────────────────────
-block_size = 128
+block_size = 256
 n_embd     = 512
 n_head     = 8
 n_layer    = 6
