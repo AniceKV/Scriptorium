@@ -420,7 +420,7 @@ col1, col2 = st.columns(2)
 with col1:
     temperature = st.slider("Temperature", 0.5, 1.5, 0.8, 0.05)
 with col2:
-    max_tokens = st.slider("Length", 10, 128, 60, 10)
+    max_tokens = st.slider("Length", 10, 200, 100, 10)
 
 use_kv_cache = st.toggle("KV Cache", value=True)
 
