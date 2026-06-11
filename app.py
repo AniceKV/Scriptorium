@@ -373,7 +373,7 @@ class GPTLanguageModel(nn.Module):
 
 
 # ── Model loading ──────────────────────────────────────────────────────────
-MODEL_PATH = "model/bible_best.pt"
+MODEL_PATH = "model/base_with_absolute_positional_embedding.pt"
 
 @st.cache_resource
 def load_model():
@@ -456,7 +456,7 @@ if generate_btn:
                         unsafe_allow_html=True
                     )
             except FileNotFoundError:
-                st.error("Model file not found. Place 'bible_best.pt' in the model/ directory.")
+                st.error("Model file not found. Place 'base_with_absolute_positional_embedding.pt' in the model/ directory.")
             except Exception as e:
                 st.error(f"Error: {e}")
 
