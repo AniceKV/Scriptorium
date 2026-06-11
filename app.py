@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import os
 import gdown
+import time
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -123,6 +124,10 @@ html, body, [data-testid="stAppViewContainer"]{
     box-shadow: 0 0 0 3px rgba(197,157,95,.15) !important;
 }
 
+[data-testid="stRadio"] label p {
+    color: #000000 !important;
+}
+
 [data-testid="stToggle"] label {
     color: #000000 !important;
 }
@@ -216,7 +221,76 @@ dropout    = 0.0
 device     = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+# ── Rotary Embedding (for RoPE model) ──────────────────────────────────────
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, head_dim, max_seq_len=2048):
+        super().__init__()
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, x, start_pos=0):
+        seq_len = x.shape[1]
+        return self.freqs[start_pos : start_pos + seq_len]
+
+def apply_rope(x, freqs):
+    x_reshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+    x_complex = torch.view_as_complex(x_reshaped)
+    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+    freqs_complex = freqs_complex.unsqueeze(0)
+    x_rotated = x_complex * freqs_complex
+    x_out = torch.view_as_real(x_rotated)
+    x_out = x_out.flatten(2)
+    return x_out.type_as(x)
+
+
 # ── Model definition ───────────────────────────────────────────────────────
+class RoPEMaskedSelfAttention(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.cache_k = None
+        self.cache_v = None
+        self.use_kv_cache = False
+        self.rope = RotaryPositionalEmbedding(head_size)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        v = self.value(x)
+
+        start_pos = self.cache_k.shape[1] if (self.use_kv_cache and self.cache_k is not None) else 0
+        freqs = self.rope(q, start_pos)
+
+        q = apply_rope(q, freqs)
+        k = apply_rope(k, freqs)
+
+        if self.use_kv_cache:
+            if self.cache_k is not None:
+                k = torch.cat([self.cache_k, k], dim=1)
+                v = torch.cat([self.cache_v, v], dim=1)
+            self.cache_k = k
+            self.cache_v = v
+
+        q_len = q.shape[1]
+        k_len = k.shape[1]
+
+        if q_len == k_len:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        return out
+
+    def clear_cache(self):
+        self.cache_k = None
+        self.cache_v = None
+
+
 class MaskedSelfAttention(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -262,6 +336,18 @@ class MaskedSelfAttention(nn.Module):
         self.cache_v = None
 
 
+class RoPEMultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([RoPEMaskedSelfAttention(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        return self.dropout(self.proj(out))
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
@@ -288,6 +374,21 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+class RoPEBlock(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = RoPEMultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
 class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
@@ -301,6 +402,65 @@ class Block(nn.Module):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
+
+
+class GPTLanguageModelWithRoPE(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.blocks = nn.Sequential(*[RoPEBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+    def _all_heads(self):
+        for block in self.blocks:
+            for head in block.sa.heads:
+                yield head
+
+    def enable_kv_cache(self):
+        for head in self._all_heads():
+            head.use_kv_cache = True
+            head.clear_cache()
+
+    def disable_kv_cache(self):
+        for head in self._all_heads():
+            head.use_kv_cache = False
+            head.clear_cache()
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        x = self.blocks(tok_emb)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            B, T, C = logits.shape
+            loss = F.cross_entropy(logits.view(B*T, C), targets.view(B*T))
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens, temperature=0.8, use_kv_cache=False):
+        if use_kv_cache:
+            self.enable_kv_cache()
+            # Process the initial prompt to fill the cache
+            _, _ = self(idx)
+
+        for _ in range(max_new_tokens):
+            if use_kv_cache:
+                idx_cond = idx[:, -1:] # Just pass the single newest token!
+            else:
+                idx_cond = idx[:, -block_size:]
+
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        if use_kv_cache:
+            self.disable_kv_cache()
+
+        return idx
 
 
 class GPTLanguageModel(nn.Module):
@@ -373,31 +533,44 @@ class GPTLanguageModel(nn.Module):
 
 
 # ── Model loading ──────────────────────────────────────────────────────────
-MODEL_PATH = "model/base_with_absolute_positional_embedding.pt"
+MODELS = {
+    "absolute": {
+        "path": "model/base_with_absolute_positional_embedding.pt",
+        "id": "1wwI9Nmhgo0UE9LWQgvYUZOaAtNomZSIV",
+        "class": GPTLanguageModel,
+    },
+    "rope": {
+        "path": "model/base_with_rope.pt",
+        "id": "1mPSY_KV7hxv3wKmH9GNZVL7cqMEb_Y9q",
+        "class": GPTLanguageModelWithRoPE,
+    }
+}
 
 @st.cache_resource
-def load_model():
-    if not os.path.exists(MODEL_PATH):
+def load_model(model_name="absolute"):
+    config = MODELS[model_name]
+    model_path = config["path"]
+
+    if not os.path.exists(model_path):
         os.makedirs("model", exist_ok=True)
-        file_id = "1wwI9Nmhgo0UE9LWQgvYUZOaAtNomZSIV"
-        with st.spinner("Downloading model..."):
+        with st.spinner(f"Downloading {model_name} model..."):
             gdown.download(
-                f"https://drive.google.com/uc?id={file_id}",
-                MODEL_PATH,
+                f"https://drive.google.com/uc?id={config['id']}",
+                model_path,
                 quiet=False
             )
-        st.success("Model downloaded successfully!")
+        st.success(f"{model_name.capitalize()} model downloaded!")
 
-    ckpt      = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-    stoi      = ckpt["stoi"]
-    itos      = ckpt["itos"]
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    stoi = ckpt["stoi"]
+    itos = ckpt["itos"]
     vocab_size = ckpt["vocab_size"]
 
     encode = lambda s: [stoi[c] for c in s if c in stoi]
     decode = lambda l: "".join([itos[i] for i in l])
 
-    model = GPTLanguageModel(vocab_size).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model = config["class"](vocab_size).to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
 
     return model, encode, decode
@@ -414,13 +587,15 @@ st.markdown("""
 st.markdown('<div class="divider">— — —</div>', unsafe_allow_html=True)
 
 st.markdown('<span class="section-label">✦ Write thy opening verse</span>', unsafe_allow_html=True)
-prompt = st.text_area("", placeholder="And God said...", height=80, label_visibility="collapsed")
+prompt = st.text_area("", value="And he who ", height=80, label_visibility="collapsed")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
-    temperature = st.slider("Temperature", 0.5, 1.5, 0.8, 0.05)
+    model_choice = st.radio("Model", ("Absolute Embedding", "RoPE Embedding"), index=1)
 with col2:
-    max_tokens = st.slider("Length", 10, 200, 100, 10)
+    temperature = st.slider("Temperature", 0.5, 1.5, 0.8, 0.05)
+with col3:
+    max_tokens = st.slider("Length", 10, 500, 100, 10)
 
 use_kv_cache = st.toggle("KV Cache", value=True)
 
@@ -435,28 +610,35 @@ if generate_btn:
     else:
         with st.spinner("The scribe writes..."):
             try:
-                model, encode, decode = load_model()
+                model_key = "rope" if model_choice == "RoPE Embedding" else "absolute"
+                model, encode, decode = load_model(model_key)
                 encoded = encode(prompt)
                 if not encoded:
                     st.error("No recognizable characters in prompt.")
                 else:
                     context = torch.tensor([encoded], dtype=torch.long, device=device)
                     with torch.no_grad():
+                        start_time = time.time()
                         output_ids = model.generate(
                             context,
                             max_new_tokens=max_tokens,
                             temperature=temperature,
                             use_kv_cache=use_kv_cache
                         )
+                        end_time = time.time()
                     output = decode(output_ids[0].tolist())
+                    duration = end_time - start_time
+                    num_tokens = output_ids.shape[1] - len(encoded)
+                    time_per_token = duration / num_tokens if num_tokens > 0 else 0
 
                     st.markdown('<span class="section-label">✦ The Scripture</span>', unsafe_allow_html=True)
                     st.markdown(
                         f'<div class="output-scroll drop-cap">{output}</div>',
                         unsafe_allow_html=True
                     )
+                    st.info(f"Generation took {duration:.2f} seconds ({time_per_token:.3f} s/token).")
             except FileNotFoundError:
-                st.error("Model file not found. Place 'base_with_absolute_positional_embedding.pt' in the model/ directory.")
+                st.error("Model file not found. Please check the `model` directory.")
             except Exception as e:
                 st.error(f"Error: {e}")
 
